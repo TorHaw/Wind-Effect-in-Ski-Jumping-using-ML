@@ -1,1 +1,1 @@
-# Modelling Wind Effect in Ski Jumping using ML
+# Modeling Wind Effect in Ski Jumping using ML
