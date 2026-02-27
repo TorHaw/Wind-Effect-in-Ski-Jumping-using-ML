@@ -2,9 +2,9 @@
 # Modeling Wind Effect in Ski Jumping Using Machine Learning
 
 Authors:
-MIDN Toren Hawk
-MIDN Travis Hockin
-Dr. Gavin Taylor
+MIDN Toren Hawk,
+MIDN Travis Hockin,
+Dr. Gavin Taylor,
 
 ---
 
