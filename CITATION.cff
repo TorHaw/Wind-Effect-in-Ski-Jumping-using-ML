@@ -1,0 +1,20 @@
+cff-version: 1.2.0
+message: "If you use this code, please cite it."
+title: "Evaluation of Wind Effects in Ski Jumping using Machine Learning"
+type: software
+authors:
+  - family-names: Hawk
+    given-names: Toren J. N.
+  - family-names: Hockin
+    given-names: Travis
+  - family-names: Taylor
+    given-names: Gavin
+repository-code: "https://github.com/<YOUR_ORG_OR_USER>/<YOUR_REPO>"
+license: MIT
+keywords:
+  - ski jumping
+  - wind compensation
+  - machine learning
+  - random forest
+  - generalized additive model
+  - sports analytics
