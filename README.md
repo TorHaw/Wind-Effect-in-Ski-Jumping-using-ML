@@ -4,7 +4,7 @@
 Authors:
 MIDN Toren Hawk,
 MIDN Travis Hockin,
-Dr. Gavin Taylor,
+and Dr. Gavin Taylor
 
 ---
 
