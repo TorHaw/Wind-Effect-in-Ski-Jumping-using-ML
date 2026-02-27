@@ -1,0 +1,1690 @@
+---
+title: 'Wind Compensation in Ski Jumping: Model Validation Women'
+author:
+- Dr. Gavin Taylor
+- MIDN Toren Hawk
+- MIDN Travis Hockin
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  html_document:
+    df_print: paged
+fontsize: 11pt
+geometry: margin=1in
+---
+
+Please note, many ggplot and ggsaves have been commented out to avoid saving unwanted graphs to your computer. To save them, simply uncomment ggplots and saves.
+
+```{r setup-theme, echo=FALSE, message=FALSE, warning=FALSE}
+# Packages (hidden for cleanliness)
+library(tidyverse)
+library(caret)
+library(randomForest)
+library(tibble)
+library(ggplot2)
+library(mgcv)
+library(dplyr)
+
+# ============================================================
+# Global Theme + Palette for All Ski Jumping Plots
+# (Persuading with Data–style, no margin() dependency)
+# ============================================================
+
+# Model / wind palettes --------------------------------------
+
+ski_palette <- c(
+  "Linear"       = "#0072B2",  # Blue
+  "RandomForest" = "#D55E00",  # Vermillion (orange-red)
+  "Polynomial"   = "#009E73",  # Bluish green
+  "GAM"          = "#CC79A7",  # Reddish purple
+  "head"         = "#0072B2",  # Blue
+  "tail"         = "#D55E00"   # Vermillion
+)
+
+
+poster_palette <- c(
+  "head"         = "#56B4E9",  # Sky blue
+  "tail"         = "#009E73",  # Bluish green
+  "Linear"       = "#56B4E9",  # Sky blue
+  "RandomForest" = "#009E73",  # Bluish green
+  "Polynomial"   = "#E69F00",  # Yellow-orange
+  "GAM"          = "#CC79A7"   # Reddish purple
+)
+
+
+# Core theme -------------------------------------------------
+
+theme_ski <- function(base_size = 14,
+                      base_family = "sans",
+                      legend_pos = "bottom") {
+
+  theme_minimal(base_size = base_size, base_family = base_family) +
+    theme(
+      # --- Titles / subtitles / caption ---
+      plot.title = element_text(
+        face = "bold",
+        size = base_size + 2,
+        hjust = 0   # left aligned
+      ),
+      plot.subtitle = element_text(
+        size = base_size,
+        hjust = 0
+      ),
+      plot.caption = element_text(
+        size  = base_size - 2,
+        hjust = 1,
+        colour = "grey40"
+      ),
+
+      # --- Axes ---
+      axis.title.x = element_text(face = "bold"),
+      axis.title.y = element_text(face = "bold"),
+      axis.text    = element_text(colour = "grey20"),
+
+      # --- Gridlines: horizontal only ---
+      panel.grid.major.x = element_blank(),
+      panel.grid.minor.x = element_blank(),
+      panel.grid.minor.y = element_blank(),
+      panel.grid.major.y = element_line(
+        colour    = "grey90",
+        linewidth = 0.3
+      ),
+
+      # --- Backgrounds set to white ---
+      panel.background = element_rect(fill = "white", colour = NA),
+      plot.background  = element_rect(fill = "white", colour = NA),
+      legend.background = element_rect(fill = "white", colour = NA),
+
+      # --- Axis & panel lines ---
+      panel.border = element_blank(),
+      axis.line    = element_line(colour = "black"),
+
+      # --- Legend ---
+      legend.position = legend_pos,
+      legend.title    = element_text(face = "bold"),
+      legend.key      = element_rect(fill = "white", colour = NA),
+
+      # --- Facet strips (now white instead of grey) ---
+      strip.background = element_rect(fill = "white", colour = NA),
+      strip.text       = element_text(face = "bold")
+    )
+}
+
+  
+
+# Color / fill scales ----------------------------------------
+
+scale_color_ski <- function(..., palette = c("paper", "poster")) {
+  palette <- match.arg(palette)
+  vals <- if (palette == "paper") ski_palette else poster_palette
+  scale_color_manual(values = vals, ...)
+}
+
+scale_fill_ski <- function(..., palette = c("paper", "poster")) {
+  palette <- match.arg(palette)
+  vals <- if (palette == "paper") ski_palette else poster_palette
+  scale_fill_manual(values = vals, ...)
+}
+
+# Set default theme for all plots in this session
+theme_set(theme_ski())
+
+exists("scale_color_ski")
+exists("scale_fill_ski")
+exists("theme_ski")
+
+```
+
+
+
+```{r}
+# Read dataset and apply core filters
+df <- read_csv("../data/female_WC_21-25.csv") %>%
+  filter(!is.na(Distance_m))
+
+df_clean <- df %>%
+  filter(!is.na(Rank), Rank <= 20) %>%
+  filter(!is.na(WindMS), WindMS >= -4, WindMS <= 4) %>%
+  mutate(Location = if_else(Location == "PERTILE Sandro", "Lake Placid", Location))
+
+glimpse(df_clean)
+
+
+```
+
+
+```{r}
+# Baseline linear model on core predictors
+predictors <- c("Speed_kmh", "WindMS", "HillSize_m")
+predictor_df <- df_clean %>% select(Distance_m, all_of(predictors)) %>% drop_na()
+linear_model_importance <- lm(Distance_m ~ Speed_kmh + WindMS + HillSize_m, data = predictor_df)
+
+summary(linear_model_importance)
+glimpse(predictor_df)
+
+```
+
+
+```{r}
+# Purpose: Construct hill-size bins and attach them to the modeling table.
+# Bins: Small (≤49), Medium (50–84), Normal (85–109), Large (110–184), Ski Flying (≥185).
+# Why: Wind and speed effects vary by hill size. Stratification supports fair comparisons.
+# Output: hill data frame with HillBin factor and no missing values in key fields.
+hill_bin <- function(HillSize_m) dplyr::case_when(
+  !is.na(HillSize_m) & HillSize_m <= 49   ~ "Small (≤49)",
+  !is.na(HillSize_m) & HillSize_m <= 84   ~ "Medium (50–84)",
+  !is.na(HillSize_m) & HillSize_m <= 109  ~ "Normal (85–109)",
+  !is.na(HillSize_m) & HillSize_m <= 184  ~ "Large (110–184)",
+  !is.na(HillSize_m) & HillSize_m >= 185  ~ "Ski Flying (≥185)",
+  TRUE ~ NA_character_
+)
+
+hill <- predictor_df %>%
+  dplyr::mutate(
+    HillSize_m = as.numeric(HillSize_m),
+    HillBin = hill_bin(HillSize_m),
+    HillBin = factor(HillBin, levels = c(
+      "Small (≤49)","Medium (50–84)","Normal (85–109)",
+      "Large (110–184)","Ski Flying (≥185)"
+    ))
+  ) %>%
+  drop_na(Distance_m, Speed_kmh, WindMS, HillSize_m, HillBin)
+  
+hill %>%
+count(HillBin, name = "n_jumps") %>%
+arrange(factor(HillBin, levels = c(
+"Small (≤49)","Medium (50–84)","Normal (85–109)",
+"Large (110–184)","Ski Flying (≥185)"
+)))
+
+hill_counts <- hill %>%
+  dplyr::count(HillBin, name = "n_jumps")
+
+# Classify wind direction and count per hill bin + wind side
+hill_counts_side <- hill %>%
+  mutate(
+    WindSide = case_when(
+      WindMS > 0  ~ "head",
+      WindMS < 0  ~ "tail",
+      TRUE        ~ NA_character_   # treat WindMS == 0 as missing for this plot
+    )
+  ) %>%
+  drop_na(WindSide) %>%
+  count(HillBin, WindSide, name = "n_jumps")
+
+hill_counts_side
+
+# Plot head vs tail counts per hill bin
+p <- ggplot(hill_counts_side,
+            aes(x = HillBin, y = n_jumps, fill = WindSide)) +
+  geom_col(position = position_dodge(width = 0.9)) +
+  geom_text(
+    aes(label = scales::comma(n_jumps)),
+    position = position_dodge(width = 0.9),
+    vjust = -0.3,
+    size = 3.8
+  ) +
+  scale_fill_manual(
+    values = ski_palette[c("head", "tail")],
+    labels = c(head = "Headwind", tail = "Tailwind"),
+    name   = "Wind direction"
+  ) +
+  scale_y_continuous(
+    expand = expansion(mult = c(0, 0.05))
+  ) +
+  labs(
+    title    = "Most female athlete jumps occur on normal and large hills",
+    subtitle = "Number of headwind and tailwind jumps by hill size category",
+    x        = "Hill size category",
+    y        = ""
+  ) +
+  theme_ski() +
+  coord_cartesian(clip = "off")
+
+p
+
+#ggsave("female/hill_bin_counts.png", plot = p, width = 16, height = 12, dpi = 600, type = "cairo-png")
+
+
+
+```
+
+
+
+```{r}
+# Purpose: Define evaluation metrics used across models.
+# Metrics: RMSE (scale of meters), R2 (variance explained on the test split).
+# --- metrics once ---
+rmse <- function(y, yhat) sqrt(mean((y - yhat)^2))
+r2   <- function(y, yhat) 1 - sum((y - yhat)^2) / sum((y - mean(y))^2)
+# Helper: Mean Absolute Percentage Error (in percent)
+mape <- function(actual, predicted) {
+  mean(abs((actual - predicted) / actual)) * 100
+}
+
+```
+
+
+```{r}
+# Purpose: Train four models with WindMS included and score on a held-out test set (80/20 split).
+# Models: Linear, degree-2 Polynomial, GAM (thin-plate splines), Random Forest.
+# Details: Adaptive k for GAM avoids overfitting/underidentification on sparse grids.
+# Output: Tibble of RMSE, R2, and MAPE sorted by RMSE for the provided hill-bin subset.
+fit_and_score_wind <- function(df_bin, seed = 2026) {
+  df_bin <- df_bin %>% drop_na(Distance_m, Speed_kmh, WindMS, HillSize_m)
+  if (nrow(df_bin) < 20) {
+    return(tibble(
+      Model = c("Linear","Polynomial","GAM","RandomForest"),
+      RMSE  = NA_real_,
+      R2    = NA_real_,
+      MAPE  = NA_real_
+    ))
+  }
+  set.seed(seed)
+  n   <- nrow(df_bin)
+  idx <- sample(seq_len(n), size = floor(0.8 * n))
+  train <- df_bin[idx, ]
+  test  <- df_bin[-idx, ]
+
+  k_speed <- max(3, min(6, length(unique(train$Speed_kmh)) - 1))
+  k_wind  <- max(3, min(6, length(unique(train$WindMS)) - 1))
+
+  m_lm   <- lm(Distance_m ~ Speed_kmh + WindMS + HillSize_m, data = train)
+  m_poly <- lm(Distance_m ~ poly(Speed_kmh, 2, raw = TRUE) +
+                               poly(WindMS,   2, raw = TRUE) +
+                               HillSize_m, data = train)
+  m_gam  <- mgcv::gam(Distance_m ~ s(Speed_kmh, k = k_speed) +
+                                   s(WindMS,   k = k_wind)  +
+                                   HillSize_m,
+                      data = train, method = "REML", select = TRUE)
+  m_rf   <- randomForest::randomForest(
+              Distance_m ~ Speed_kmh + WindMS + HillSize_m,
+              data = train, importance = TRUE
+            )
+
+  preds <- list(
+    Linear       = predict(m_lm,   test),
+    Polynomial   = predict(m_poly, test),
+    GAM          = predict(m_gam,  test),
+    RandomForest = predict(m_rf,   test)
+  )
+
+  tibble(
+    Model = names(preds),
+    RMSE  = purrr::map_dbl(preds, ~ rmse(test$Distance_m, .x)),
+    R2    = purrr::map_dbl(preds, ~ r2(test$Distance_m, .x)),
+    MAPE  = purrr::map_dbl(preds, ~ mape(test$Distance_m, .x))
+  ) %>% arrange(RMSE)
+}
+
+```
+
+
+```{r}
+# Purpose: Same as above but exclude WindMS to quantify its incremental value.
+# Models and split: Identical choices and 80/20 partition as with-wind pipeline.
+# Output: Tibble of RMSE, R2, and MAPE for the no-wind specification.
+fit_and_score_nowind <- function(df_bin, seed = 2026) {
+  df_bin <- df_bin %>% drop_na(Distance_m, Speed_kmh, HillSize_m)
+  if (nrow(df_bin) < 20) {
+    return(tibble(
+      Model = c("Linear","Polynomial","GAM","RandomForest"),
+      RMSE  = NA_real_,
+      R2    = NA_real_,
+      MAPE  = NA_real_
+    ))
+  }
+  set.seed(seed)
+  n   <- nrow(df_bin)
+  idx <- sample(seq_len(n), size = floor(0.8 * n))
+  train <- df_bin[idx, ]
+  test  <- df_bin[-idx, ]
+
+  k_speed <- max(3, min(6, length(unique(train$Speed_kmh)) - 1))
+
+  m_lm   <- lm(Distance_m ~ Speed_kmh + HillSize_m, data = train)
+  m_poly <- lm(Distance_m ~ poly(Speed_kmh, 2, raw = TRUE) + HillSize_m, data = train)
+  m_gam  <- mgcv::gam(Distance_m ~ s(Speed_kmh, k = k_speed) + HillSize_m,
+                      data = train, method = "REML", select = TRUE)
+  m_rf   <- randomForest::randomForest(
+              Distance_m ~ Speed_kmh + HillSize_m,
+              data = train, importance = TRUE
+            )
+
+  preds <- list(
+    Linear       = predict(m_lm,   test),
+    Polynomial   = predict(m_poly, test),
+    GAM          = predict(m_gam,  test),
+    RandomForest = predict(m_rf,   test)
+  )
+
+  tibble(
+    Model = names(preds),
+    RMSE  = purrr::map_dbl(preds, ~ rmse(test$Distance_m, .x)),
+    R2    = purrr::map_dbl(preds, ~ r2(test$Distance_m, .x)),
+    MAPE  = purrr::map_dbl(preds, ~ mape(test$Distance_m, .x))
+  ) %>% arrange(RMSE)
+}
+
+```
+
+
+```{r}
+# Purpose: Train four models with WindMS included and score on a held-out test set (80/20 split).
+# Models: Linear, degree-2 Polynomial, GAM (thin-plate splines), Random Forest.
+# Details: Adaptive k for GAM avoids overfitting/underidentification on sparse grids.
+# Output: Tibble of RMSE and R2 sorted by RMSE for the provided hill-bin subset.
+res_small_wind  <- hill %>% filter(HillBin == "Small (≤49)")       %>% fit_and_score_wind()
+res_med_wind    <- hill %>% filter(HillBin == "Medium (50–84)")     %>% fit_and_score_wind()
+res_norm_wind   <- hill %>% filter(HillBin == "Normal (85–109)")    %>% fit_and_score_wind()
+res_large_wind  <- hill %>% filter(HillBin == "Large (110–184)")    %>% fit_and_score_wind()
+res_sf_wind     <- hill %>% filter(HillBin == "Ski Flying (≥185)")  %>% fit_and_score_wind()
+
+res_norm_wind
+res_large_wind
+res_sf_wind
+```
+
+
+
+```{r}
+# Purpose: Same as above but exclude WindMS to quantify its incremental value.
+# Models and split: Identical choices and 80/20 partition as with-wind pipeline.
+# Output: Tibble of RMSE and R2 for the no-wind specification.
+res_small_now   <- hill %>% filter(HillBin == "Small (≤49)")       %>% fit_and_score_nowind()
+res_med_now     <- hill %>% filter(HillBin == "Medium (50–84)")     %>% fit_and_score_nowind()
+res_norm_now    <- hill %>% filter(HillBin == "Normal (85–109)")    %>% fit_and_score_nowind()
+res_large_now   <- hill %>% filter(HillBin == "Large (110–184)")    %>% fit_and_score_nowind()
+res_sf_now      <- hill %>% filter(HillBin == "Ski Flying (≥185)")  %>% fit_and_score_nowind()
+
+res_norm_now
+res_large_now
+res_sf_now
+```
+
+
+```{r}
+# Purpose: Function to visualize predicted vs. actual distances for four model families.
+# Notes: Uses an 80/20 split. Facets by model. 45-degree line indicates perfect fit.
+# Option: with_wind switch toggles inclusion of WindMS in the models.
+plot_pred_vs_actual <- function(df_bin, with_wind = TRUE, seed = 2026, title_suffix = "") {
+  if (with_wind) {
+    df_bin <- df_bin %>% drop_na(Distance_m, Speed_kmh, WindMS, HillSize_m)
+  } else {
+    df_bin <- df_bin %>% drop_na(Distance_m, Speed_kmh, HillSize_m)
+  }
+  if (nrow(df_bin) < 20) {
+    warning("Not enough rows to plot.")
+    return(invisible(NULL))
+  }
+  set.seed(seed)
+  n   <- nrow(df_bin)
+  idx <- sample(seq_len(n), size = floor(0.8 * n))
+  train <- df_bin[idx, ]
+  test  <- df_bin[-idx, ]
+
+  if (with_wind) {
+    k_speed <- max(3, min(6, length(unique(train$Speed_kmh)) - 1))
+    k_wind  <- max(3, min(6, length(unique(train$WindMS)) - 1))
+
+    m_lm   <- lm(Distance_m ~ Speed_kmh + WindMS + HillSize_m, data = train)
+    m_poly <- lm(Distance_m ~ poly(Speed_kmh, 2, raw = TRUE) +
+                                 poly(WindMS,   2, raw = TRUE) +
+                                 HillSize_m, data = train)
+    m_gam  <- mgcv::gam(Distance_m ~ s(Speed_kmh, k = k_speed) +
+                                     s(WindMS,   k = k_wind)  +
+                                     HillSize_m,
+                        data = train, method = "REML", select = TRUE)
+    m_rf   <- randomForest::randomForest(
+                Distance_m ~ Speed_kmh + WindMS + HillSize_m,
+                data = train, importance = TRUE
+              )
+  } else {
+    k_speed <- max(3, min(6, length(unique(train$Speed_kmh)) - 1))
+    m_lm   <- lm(Distance_m ~ Speed_kmh + HillSize_m, data = train)
+    m_poly <- lm(Distance_m ~ poly(Speed_kmh, 2, raw = TRUE) + HillSize_m, data = train)
+    m_gam  <- mgcv::gam(Distance_m ~ s(Speed_kmh, k = k_speed) + HillSize_m,
+                        data = train, method = "REML", select = TRUE)
+    m_rf   <- randomForest::randomForest(
+                Distance_m ~ Speed_kmh + HillSize_m,
+                data = train, importance = TRUE
+              )
+  }
+
+  preds <- tibble(
+    Linear       = predict(m_lm,   test),
+    Polynomial   = predict(m_poly, test),
+    GAM          = predict(m_gam,  test),
+    RandomForest = predict(m_rf,   test)
+  )
+
+  long <- preds %>%
+    mutate(Actual = test$Distance_m) %>%
+    pivot_longer(cols = c(Linear, Polynomial, GAM, RandomForest),
+                 names_to = "Model", values_to = "Predicted")
+
+  ggplot(long, aes(x = Actual, y = Predicted, color = Model)) +
+  geom_point(alpha = 0.35) +
+  geom_abline(slope = 1, intercept = 0, linetype = 2) +
+  facet_wrap(~ Model, scales = "free") +
+  labs(
+    title = paste0("Predicted vs Actual Distance (Female Athletes)\n", title_suffix),
+    subtitle = if (with_wind) "Models include WindMS" else "Models exclude WindMS",
+    x = "Actual Distance (m)",
+    y = "Predicted Distance (m)"
+  ) + scale_fill_ski() 
+
+
+}
+
+
+# ======================================================
+# 2) Estimated Wind Effect — all models in one chart
+#    - Colored lines + legend
+#    - Zero reference line at WindMS = 0
+#    - Clear axis labelling (+ headwind, – tailwind)
+# ======================================================
+plot_wind_effect <- function(df_bin, wind_range = NULL, seed = 2026, title_suffix = "") {
+
+  df_bin <- df_bin %>% drop_na(Distance_m, Speed_kmh, WindMS, HillSize_m)
+  if (nrow(df_bin) < 20) {
+    warning("Not enough rows to plot.")
+    return(invisible(NULL))
+  }
+
+  set.seed(seed)
+  n   <- nrow(df_bin)
+  idx <- sample(seq_len(n), size = floor(0.8 * n))
+  train <- df_bin[idx, ]
+
+  k_speed <- max(3, min(6, length(unique(train$Speed_kmh)) - 1))
+  k_wind  <- max(3, min(6, length(unique(train$WindMS)) - 1))
+
+  m_lm   <- lm(Distance_m ~ Speed_kmh + WindMS + HillSize_m, data = train)
+  m_poly <- lm(Distance_m ~ poly(Speed_kmh, 2, raw = TRUE) +
+                               poly(WindMS,   2, raw = TRUE) +
+                               HillSize_m, data = train)
+  m_gam  <- mgcv::gam(Distance_m ~ s(Speed_kmh, k = k_speed) +
+                                   s(WindMS,   k = k_wind)  +
+                                   HillSize_m,
+                      data = train, method = "REML", select = TRUE)
+  m_rf   <- randomForest::randomForest(
+    Distance_m ~ Speed_kmh + WindMS + HillSize_m,
+    data = train, importance = TRUE
+  )
+
+  med_speed <- median(train$Speed_kmh, na.rm = TRUE)
+  med_hs    <- median(train$HillSize_m, na.rm = TRUE)
+  if (is.null(wind_range)) {
+    wmin <- quantile(train$WindMS, 0.02, na.rm = TRUE)
+    wmax <- quantile(train$WindMS, 0.98, na.rm = TRUE)
+  } else {
+    wmin <- wind_range[1]; wmax <- wind_range[2]
+  }
+
+  newd <- tibble(
+    Speed_kmh  = med_speed,
+    WindMS     = seq(wmin, wmax, length.out = 200),
+    HillSize_m = med_hs
+  )
+
+  out <- tibble(
+    WindMS        = newd$WindMS,
+    Linear        = predict(m_lm,   newd),
+    Polynomial    = predict(m_poly, newd),
+    GAM           = predict(m_gam,  newd),
+    RandomForest  = predict(m_rf,   newd)
+  ) %>%
+    pivot_longer(-WindMS, names_to = "Model", values_to = "Predicted_Distance")
+
+    ggplot(out, aes(WindMS, Predicted_Distance, 
+                color = Model, 
+                linetype = Model)) +
+  geom_vline(xintercept = 0, linetype = 3) +
+  geom_line(linewidth = 1) +
+  scale_linetype_manual(values = c(
+    "Linear"       = "solid",
+    "Polynomial"   = "dashed",
+    "GAM"          = "dotdash",
+    "RandomForest" = "twodash"
+  )) +
+  scale_color_ski() +
+  labs(
+    title = paste0("Estimated Wind Effect on Distance (Female Athletes)", title_suffix),
+    subtitle = "Speed_kmh and HillSize_m held at medians",
+    x = "WindMS (+ headwind / − tailwind)",
+    y = "Predicted Distance (m)"
+  ) +
+  theme_ski()
+
+}
+```
+
+
+
+
+
+```{r}
+# Purpose: Generate core figures for representative bins (Normal, Large, Ski Flying).
+# Plots: (1) Predicted vs Actual, (2) Estimated Wind Effect curves.
+# Option: An extra call illustrates models without WindMS for sensitivity.
+
+
+# Normal hill (with wind)
+hill_norm <- hill %>% filter(HillBin == "Normal (85–109)")
+
+p <- plot_pred_vs_actual(hill_norm, with_wind = TRUE,  title_suffix = "— Normal (85–109)") + scale_color_ski()
+#ggsave("female/norm_pred_v_act.png", plot = p, width = 16, height = 12, dpi = 600, type = "cairo-png")
+p <- plot_wind_effect(hill_norm, title_suffix = "— Normal (85–109)") + scale_color_ski()
+#ggsave("female/norm_wind_effect.png", plot = p, width = 16, height = 12, dpi = 600, type = "cairo-png")
+
+# Large hill (with and without wind)
+hill_large <- hill %>% filter(HillBin == "Large (110–184)")
+p <- plot_pred_vs_actual(hill_large, with_wind = TRUE,  title_suffix = "— Large (110–184)") + scale_color_ski()
+#ggsave("female/large_pred_v_act.png", plot = p, width = 16, height = 12, dpi = 600, type = "cairo-png")
+p <- plot_wind_effect(hill_large,                        title_suffix = "— Large (110–184)") + scale_color_ski()
+#ggsave("female/large_wind_effect.png", plot = p, width = 16, height = 12, dpi = 600, type = "cairo-png")
+p <- plot_pred_vs_actual(hill_large, with_wind = FALSE, title_suffix = "— Large (110–184), No-Wind") + scale_color_ski()
+#ggsave("female/large_pred_v_act_nowind.png", plot = p, width = 16, height = 12, dpi = 600, type = "cairo-png")
+
+# Ski flying
+hill_sf <- hill %>% filter(HillBin == "Ski Flying (≥185)")
+p <- plot_pred_vs_actual(hill_sf, with_wind = TRUE, title_suffix = "— Ski Flying (≥185)") + scale_color_ski()
+#ggsave("female/sf_pred_v_act.png", plot = p, width = 16, height = 12, dpi = 600, type = "cairo-png")
+p <- plot_wind_effect(hill_sf, title_suffix = "— Ski Flying (≥185)") + scale_color_ski()
+#ggsave("female/sf_wind_effect.png", plot = p, width = 16, height = 12, dpi = 600, type = "cairo-png")
+
+```
+
+
+```{r}
+# Purpose: Descriptive count of jump observations by Location and HillSize_m.
+# Why: Confirms sample sizes driving model stability and highlights data imbalance.
+
+df_clean %>%
+  mutate(
+    WindSide = case_when(
+      WindMS > 0  ~ "head",
+      WindMS < 0  ~ "tail",
+      TRUE        ~ "calm"   # keep zero-wind if you want to track it; remove if not needed
+    )
+  ) %>%
+  group_by(Location, HillSize_m) %>%
+  summarise(
+    total_jumps = n(),
+    head_wind_jumps = sum(WindSide == "head", na.rm = TRUE),
+    tail_wind_jumps = sum(WindSide == "tail", na.rm = TRUE),
+    # remove calm if unused — or uncomment to show:
+    # calm_jumps = sum(WindSide == "calm", na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(total_jumps))
+```
+
+
+```{r}
+# Purpose: Case study at Hinzenbach (Normal hill, HS 85–109).
+# Method: Fit Random Forest and Linear models on the same 80/20 split; compare predictions
+#         and visualize actual vs predicted scatter with 1:1 reference.
+# Output: Head of error tables and two diagnostic plots.
+fit_distance_models_by_location <- function(df_clean,
+                                            location,
+                                            hs_min = 85,
+                                            hs_max = 109,
+                                            seed   = 2026,
+                                            rf_ntree = 500) {
+  location = as.character(location)
+  dat_loc <- df_clean %>%
+    filter(Location == location,
+           HillSize_m >= hs_min, HillSize_m <= hs_max) %>%
+    drop_na(Distance_m, Speed_kmh, WindMS, HillSize_m)
+
+  n <- nrow(dat_loc)
+  if (is.na(n) || n < 10) {
+    stop(glue::glue("Not enough rows for {location} (HS {hs_min}-{hs_max}). Found n = {n}."))
+  }
+
+  set.seed(seed)
+  train_idx <- sample(seq_len(n), size = floor(0.8 * n))
+  train <- dat_loc[train_idx, ]
+  test  <- dat_loc[-train_idx, ]
+
+  rf <- randomForest(
+    Distance_m ~ Speed_kmh + WindMS + HillSize_m,
+    data = train, importance = TRUE, ntree = rf_ntree
+  )
+
+  lm_fit <- lm(Distance_m ~ Speed_kmh + WindMS + HillSize_m, data = train)
+
+  test_lm <- test %>%
+    mutate(
+      Predicted      = predict(lm_fit, newdata = .),
+      Error          = Predicted - Distance_m,
+      PercentError   = if_else(Distance_m != 0,
+                               100 * (Predicted - Distance_m) / Distance_m,
+                               NA_real_),
+      AbsPercentError = abs(PercentError)
+    )
+
+  test_rf <- test %>%
+    mutate(
+      Predicted      = predict(rf, newdata = .),
+      Error          = Predicted - Distance_m,
+      PercentError   = if_else(Distance_m != 0,
+                               100 * (Predicted - Distance_m) / Distance_m,
+                               NA_real_),
+      AbsPercentError = abs(PercentError)
+    )
+
+  rmse <- function(y, yhat) sqrt(mean((yhat - y)^2, na.rm = TRUE))
+
+  summary_tbl <- tibble(
+    Location = location,
+    HS_Band  = glue::glue("{hs_min}-{hs_max}"),
+    Model = c("Random Forest", "Linear Model"),
+    MeanPercentError = c(mean(test_rf$PercentError,  na.rm = TRUE),
+                         mean(test_lm$PercentError,  na.rm = TRUE)),
+    MeanAbsPercentError = c(mean(test_rf$AbsPercentError, na.rm = TRUE),
+                            mean(test_lm$AbsPercentError, na.rm = TRUE)),
+    RMSE = c(rmse(test_rf$Distance_m, test_rf$Predicted),
+             rmse(test_lm$Distance_m, test_lm$Predicted))
+  )
+
+  title_suffix <- glue::glue("{location} (HS {hs_min}-{hs_max})")
+
+  p_rf <- ggplot(test_rf, aes(x = Distance_m, y = Predicted)) +
+  geom_point(aes(color = "RandomForest"), alpha = 0.5, size = 2) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "black") +
+  labs(
+    title = glue::glue("Actual vs. predicted jump distance for Random Forest (80/20 test split) — {title_suffix}"),  # HEADLINE
+    x = "Actual Distance (m)",
+    y = "Predicted Distance (m)",
+    color = "Model"
+  ) +
+  scale_color_ski() +
+  theme_ski() +
+  theme(
+    axis.title.y = element_text(angle = 0, vjust = 0.5)   # HORIZONTAL Y-AXIS LABEL
+  )
+
+
+  p_lm <- ggplot(test_lm, aes(x = Distance_m, y = Predicted)) +
+  geom_point(aes(color = "Linear"), alpha = 0.5, size =2) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "black") +
+  labs(
+    title = glue::glue("Actual vs. predicted jump distance for Linear Model (80/20 test split) — {title_suffix}"),  # HEADLINE
+    x = "Actual Distance (m)",
+    y = "Predicted Distance (m)",
+    color = "Model"
+  ) +
+  scale_color_ski() +
+  theme_ski() +
+  theme(
+    axis.title.y = element_text(angle = 0, vjust = 0.5)   # HORIZONTAL Y-AXIS LABEL
+  )
+
+
+# Combine both model results for faceting
+plot_dat <- bind_rows(
+  test_rf  %>% mutate(Model = "RandomForest"),
+  test_lm  %>% mutate(Model = "Linear")
+)
+
+p_faceted <- ggplot(plot_dat, aes(x = Distance_m, y = Predicted, color = Model)) +
+  geom_point(alpha = 0.5, size = 2) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "black") +
+  facet_wrap(~ Model) +
+  labs(
+    title = glue::glue("Random Forest and Linear models both yield similar accuracy and results. — {title_suffix}"),   # HEADLINE
+    subtitle = "Actual vs. predicted jump distances for Random Forest and Linear models (80/20 test split)", # WHAT THE GRAPH SHOWS
+    x = "Actual Distance (m)",
+    y = "Predicted Distance (m)",
+    color = "Model"
+  ) +
+  scale_color_ski() +
+  theme_ski() +
+  theme(
+    axis.title.y = element_text(angle = 0, vjust = 0.5)  # horizontal label
+  )
+
+  list(
+    data_used     = dat_loc,
+    train         = train,
+    test_rf       = test_rf,
+    test_lm       = test_lm,
+    rf_model      = rf,
+    lm_model      = lm_fit,
+    performance   = summary_tbl,
+    plot_rf       = p_rf,
+    plot_lm       = p_lm,
+    plot_faceted = p_faceted
+  )
+}
+```
+
+
+
+```{r}
+# Example venue runs (large hill band)
+res_trd <- fit_distance_models_by_location(df_clean, "Hinzenbach", 85, 109)
+
+# Peek at predictions
+head(res_trd$test_rf %>% select(Name, Distance_m, Predicted, Error, PercentError, AbsPercentError))
+head(res_trd$test_lm %>% select(Name, Distance_m, Predicted, Error, PercentError, AbsPercentError))
+
+# Compare models
+res_trd$performance
+
+# Plots
+
+p = res_trd$plot_faceted
+#ggsave("female/faceted_case_study.png", plot = p, width = 16, height = 12, dpi = 600, type = "cairo-png")
+p <- res_trd$plot_rf
+#ggsave("female/randfor_case_study.png", plot = p, width = 16, height = 12, dpi = 600, type = "cairo-png")
+p <- res_trd$plot_lm
+#ggsave("female/linear_case_study.png", plot = p, width = 16, height = 12, dpi = 600, type = "cairo-png")
+```
+
+
+
+```{r}
+Lillehammer <- fit_distance_models_by_location(df_clean, "Lillehammer", 110, 184)
+Sapporo <- fit_distance_models_by_location(df_clean, "Sapporo", 110, 184)
+Oslo <- fit_distance_models_by_location(df_clean, "Oslo", 110, 184)
+Willingen <- fit_distance_models_by_location(df_clean, "Willingen", 110, 184)
+Lahti <- fit_distance_models_by_location(df_clean, "Lahti", 110, 184)
+
+Lillehammer$performance
+Sapporo$performance
+Oslo$performance
+Willingen$performance
+Lahti$performance
+```
+
+
+
+```{r}
+# ============================================================
+# Wind Compensation Validation with 80/20 Train/Test Split
+# Models compared: Linear vs Random Forest
+# ------------------------------------------------------------
+# What this does:
+# - For each group (HillBin or Location) and wind side (head/tail),
+#   split data 80/20 into train/test.
+# - Fit two models on TRAIN:
+#       (1) Linear: Distance_m ~ Speed_kmh + HillSize_m + WindMS
+#       (2) Random Forest: same predictors
+# - Derive a model-based wind factor (meters per m/s) for each model:
+#       - Linear: the WindMS coefficient directly.
+#       - RF: finite-difference derivative at a representative wind (w0)
+# - Convert meters-per-(m/s) -> points-per-(m/s) using median MeterValue.
+# - Evaluate on TEST: RMSE, R2, and residuals vs awarded WindPts.
+# - Compare model-based factors to official HeadWindFactor/TailWindFactor.
+# ============================================================
+
+# PATCH to fix: "missing values in object" (na.fail in lm/predict)
+# Cause: some groups/sides had NAs in required predictors/columns.
+# Fix: aggressively drop NAs BEFORE splitting and again inside the side estimator,
+#      and only score on complete test rows.
+
+# -----------------------------
+# 0) Utility: 80/20 split
+# -----------------------------
+
+
+df_clean <- df_clean %>%
+  mutate(
+    HillBin = hill_bin(HillSize_m),
+    HillBin = factor(HillBin, levels = c(
+      "Small (≤49)","Medium (50–84)","Normal (85–109)",
+      "Large (110–184)","Ski Flying (≥185)"
+    ))
+  )
+
+
+train_test_split <- function(df, prop = 0.8, seed = 2026) {
+  set.seed(seed)
+  n <- nrow(df)
+  if (n < 10) return(list(train = df[0, ], test = df[0, ]))
+  idx <- sample(seq_len(n), size = floor(prop * n))
+  list(train = df[idx, ], test = df[-idx, ])
+}
+
+# ------------------------------------------------
+# 1) RF local slope wrt WindMS via finite diff
+# ------------------------------------------------
+rf_wind_slope_fd <- function(rf_model, ref_speed, ref_hs, w0, h = 0.2) {
+  newd1 <- tibble(Speed_kmh = ref_speed, HillSize_m = ref_hs, WindMS = w0 - h)
+  newd2 <- tibble(Speed_kmh = ref_speed, HillSize_m = ref_hs, WindMS = w0 + h)
+  y1 <- predict(rf_model, newdata = newd1)
+  y2 <- predict(rf_model, newdata = newd2)
+  as.numeric((y2 - y1) / (2*h))  # meters per (m/s)
+}
+
+# ----------------------------------------------------------
+# 2) Metrics for test scoring
+# ----------------------------------------------------------
+rmse <- function(y, yhat) sqrt(mean((y - yhat)^2, na.rm = TRUE))
+r2   <- function(y, yhat) 1 - sum((y - yhat)^2, na.rm = TRUE) / sum((y - mean(y, na.rm = TRUE))^2, na.rm = TRUE)
+
+# ---------------------------------------------------------------------
+# 3) Estimate model-based wind factor for ONE side and ONE model
+#    (NOW drops NAs inside)
+# ---------------------------------------------------------------------
+estimate_side_factor <- function(df_train_side, model_type = c("lm","rf")) {
+  model_type <- match.arg(model_type)
+  req <- c("Distance_m","Speed_kmh","WindMS","HillSize_m","MeterValue_pts_per_m")
+  if (!all(req %in% names(df_train_side))) return(NULL)
+
+  # Drop NAs to avoid na.fail in lm/predict
+  df_train_side <- df_train_side %>% tidyr::drop_na(dplyr::all_of(req))
+  if (nrow(df_train_side) < 20) return(NULL)
+
+  mv <- median(df_train_side$MeterValue_pts_per_m, na.rm = TRUE)
+
+  if (model_type == "lm") {
+    m <- lm(Distance_m ~ Speed_kmh + HillSize_m + WindMS, data = df_train_side)
+    slope <- unname(coef(m)["WindMS"])  # meters per (m/s)
+  } else {
+    m <- randomForest(Distance_m ~ Speed_kmh + HillSize_m + WindMS,
+                      data = df_train_side, importance = TRUE)
+    ref_speed <- median(df_train_side$Speed_kmh,  na.rm = TRUE)
+    ref_hs    <- median(df_train_side$HillSize_m, na.rm = TRUE)
+    w0        <- median(df_train_side$WindMS,     na.rm = TRUE)
+    slope     <- rf_wind_slope_fd(m, ref_speed, ref_hs, w0, h = 0.2)
+  }
+
+  list(
+    slope_m_per_ms = slope,
+    pts_per_ms     = slope * mv,
+    meter_value    = mv,
+    model          = m
+  )
+}
+```
+
+```{r}
+# -----------------------------------------------------------------------------------
+# 4) Evaluate ONE group's data (e.g., a single HillBin or Location)
+#    (NOW cleans NAs before split; predicts on complete test rows only)
+# -----------------------------------------------------------------------------------
+evaluate_one_group <- function(df_group, group_label) {
+  # Keep only rows with all required fields present
+  req <- c("Distance_m","Speed_kmh","WindMS","HillSize_m",
+           "MeterValue_pts_per_m","WindPts","HeadWindFactor","TailWindFactor")
+  df_group <- df_group %>% tidyr::drop_na(dplyr::all_of(req))
+
+  # 80/20 split at group level
+  tt <- train_test_split(df_group, prop = 0.8, seed = 2026)
+  train_all <- tt$train
+  test_all  <- tt$test
+
+  # Official factors taken from TRAIN (robust to outliers)
+  off_head <- suppressWarnings(median(train_all$HeadWindFactor, na.rm = TRUE))
+  off_tail <- suppressWarnings(median(train_all$TailWindFactor, na.rm = TRUE))
+
+  # helper to produce rows for a given side
+  build_rows_for_side <- function(side_label, official_factor) {
+    if (side_label == "head") {
+      train_side <- dplyr::filter(train_all, WindMS > 0)
+      test_side  <- dplyr::filter(test_all,  WindMS > 0)
+    } else {
+      train_side <- dplyr::filter(train_all, WindMS < 0)
+      test_side  <- dplyr::filter(test_all,  WindMS < 0)
+    }
+
+    # Ensure complete cases for TEST before scoring/predicting
+    test_req <- c("Distance_m","Speed_kmh","WindMS","HillSize_m","MeterValue_pts_per_m","WindPts")
+    test_side_cc <- test_side %>% tidyr::drop_na(dplyr::all_of(test_req))
+
+    out_rows <- list()
+    for (mt in c("Linear","RandomForest")) {
+      mt_code <- if (mt == "Linear") "lm" else "rf"
+      fit <- estimate_side_factor(train_side, mt_code)
+
+      if (is.null(fit)) {
+        out_rows[[mt]] <- tibble(
+          Group = group_label, side = side_label, Model = mt,
+          n_train_side = nrow(train_side), n_test_side = nrow(test_side_cc),
+          model_m_per_ms = NA_real_,
+          model_pts_per_ms = NA_real_,
+          official_pts_per_ms = official_factor,
+          gap_pts_per_ms = NA_real_,
+          gap_pct = NA_real_,
+          RMSE = NA_real_, R2 = NA_real_,
+          windpts_bias_mean = NA_real_,
+          windpts_mae = NA_real_,
+          windpts_iqr = NA_real_
+        )
+      } else {
+        # Distance scoring on TEST (complete cases only)
+        if (nrow(test_side_cc) > 0) {
+          yhat <- predict(fit$model, newdata = test_side_cc)
+          m_rmse <- rmse(test_side_cc$Distance_m, yhat)
+          m_r2   <- r2(test_side_cc$Distance_m, yhat)
+        } else {
+          m_rmse <- NA_real_; m_r2 <- NA_real_
+        }
+
+        # WindPts residuals on TEST using this model's slope
+        if (nrow(test_side_cc) > 0 && !is.na(fit$slope_m_per_ms)) {
+          delta_m_hat <- fit$slope_m_per_ms * test_side_cc$WindMS
+          windpts_hat <- - delta_m_hat * test_side_cc$MeterValue_pts_per_m
+          resids <- test_side_cc$WindPts - windpts_hat
+          bias_mean <- mean(resids, na.rm = TRUE)
+          mae       <- mean(abs(resids), na.rm = TRUE)
+          iqrv      <- IQR(resids, na.rm = TRUE)
+        } else {
+          bias_mean <- mae <- iqrv <- NA_real_
+        }
+
+        gap_pts <- fit$pts_per_ms - official_factor
+        gap_pct <- 100 * gap_pts / official_factor
+
+        out_rows[[mt]] <- tibble(
+          Group = group_label, side = side_label, Model = mt,
+          n_train_side = nrow(train_side), n_test_side = nrow(test_side_cc),
+          model_m_per_ms = fit$slope_m_per_ms,
+          model_pts_per_ms = fit$pts_per_ms,
+          official_pts_per_ms = official_factor,
+          gap_pts_per_ms = gap_pts,
+          gap_pct = gap_pct,
+          RMSE = m_rmse, R2 = m_r2,
+          windpts_bias_mean = bias_mean,
+          windpts_mae = mae,
+          windpts_iqr = iqrv
+        )
+      }
+    }
+    bind_rows(out_rows$Linear, out_rows$RandomForest)
+  }
+
+  bind_rows(
+    build_rows_for_side("head", off_head),
+    build_rows_for_side("tail", off_tail)
+  )
+}
+```
+
+```{r}
+# -----------------------------------------------------------------------------------
+# 5) MAIN: evaluate across groups (split + map) — robust to NAs
+# -----------------------------------------------------------------------------------
+evaluate_wind_compensation_tt <- function(df, level = c("HillBin","Location")) {
+  level <- match.arg(level)
+  needed <- c("Distance_m","Speed_kmh","WindMS","HillSize_m",
+              "MeterValue_pts_per_m","WindPts","HeadWindFactor","TailWindFactor", level)
+  stopifnot(all(needed %in% names(df)))
+
+  # Split df into a named list of data.frames by the grouping column (drop NA groups)
+  parts <- split(df, df[[level]], drop = TRUE)
+
+  # Map over groups and bind the results
+  res <- purrr::imap(parts, ~ evaluate_one_group(.x, group_label = .y))
+  dplyr::bind_rows(res) %>%
+    dplyr::mutate(Group = as.character(Group)) %>%
+    dplyr::relocate(Group, side, Model)
+}
+```
+
+
+
+```{r}
+
+
+# ============================================================
+# Wind Compensation Evaluation — Sorted by |gap_pct|
+# ============================================================
+
+# --- By HillBin ---
+results_bin <- evaluate_wind_compensation_tt(df_clean, level = "HillBin") %>%
+  # Add absolute gap column
+  mutate(abs_gap_pct = abs(gap_pct)) %>%
+  # Sort by smallest absolute percent gap
+  arrange((abs_gap_pct))
+
+# View results
+results_bin
+
+
+# --- By Location (data-rich venues only) ---
+df_loc <- df_clean %>%
+  tidyr::drop_na(Distance_m, Speed_kmh, WindMS, HillSize_m, MeterValue_pts_per_m) %>%
+  dplyr::add_count(Location, name = "n_loc") %>%
+  dplyr::filter(n_loc >= 150)
+
+results_loc <- evaluate_wind_compensation_tt(df_loc, level = "Location") %>%
+  # Add absolute gap column
+  mutate(abs_gap_pct = abs(gap_pct)) %>%
+  # Sort by smallest absolute percent gap
+  arrange((abs_gap_pct))
+
+# View results
+results_loc
+
+## PLOTTING
+
+# Filter linear only
+bin_linear <- results_bin %>%
+  filter(Model == "Linear")
+
+p <- ggplot(bin_rf, aes(x = Group, y = mean_abs_gap_pct, fill = side)) +
+  geom_col(position = "dodge") +
+  geom_text(
+    aes(label = paste0(round(mean_abs_gap_pct, 1), "%")),
+    position = position_dodge(width = 0.9),
+    vjust = -0.3,
+    size = 7   # increased for readability
+  ) +
+  scale_fill_manual(
+    name = "Wind Direction",
+    values = ski_palette,
+    labels = c("head" = "Headwind", "tail" = "Tailwind")
+  ) +
+  scale_y_continuous(limits = c(0, 220)) +
+  labs(
+    title    = "Random Forest",
+    subtitle = NULL,
+    x        = "Hill size bin",
+    y        = "Percent Error"
+  ) +
+  theme_ski() +
+  theme(
+    text = element_text(size = 22),
+    axis.title.x = element_text(size = 26),
+    axis.title.y = element_text(size = 26, angle = 90),
+    axis.text = element_text(size = 22),
+    legend.title = element_text(size = 24),
+    legend.text = element_text(size = 20),
+    strip.text = element_text(size = 24),
+    plot.title = element_text(size = 32),
+    plot.subtitle = element_blank()
+  )
+
+
+#ggsave("female/randfor_gap_perc_hill.png", plot = p, width = 16, height = 12,dpi = 600, type = "cairo-png")
+
+
+p <- ggplot(bin_linear, aes(x = Group, y = abs_gap_pct, fill = side)) +
+  geom_col(position = "dodge") +
+  geom_text(
+    aes(label = paste0(round(abs_gap_pct, 1), "%")),
+    position = position_dodge(width = 0.9),
+    vjust = -0.3,
+    size = 7   # increased for readability
+  ) +
+  scale_fill_manual(
+    name = "Wind Direction",
+    values = ski_palette,
+    labels = c("head" = "Headwind", "tail" = "Tailwind")
+  ) +
+  scale_y_continuous(limits = c(0, 220)) +
+  labs(
+    title    = "Linear",
+    subtitle = NULL,
+    x        = "Hill size bin",
+    y        = "Percent Error"
+  ) +
+  theme_ski() +
+  theme(
+    text = element_text(size = 22),
+    axis.title.x = element_text(size = 26),
+    axis.title.y = element_text(size = 26, angle = 90),
+    axis.text = element_text(size = 22),
+    legend.title = element_text(size = 24),
+    legend.text = element_text(size = 20),
+    strip.text = element_text(size = 24),
+    plot.title = element_text(size =32),
+    plot.subtitle = element_blank()
+  )
+
+
+
+#ggsave("female/linear_gap_perc_hill.png", plot = p, width = 16, height = 12,dpi = 600, type = "cairo-png")
+
+
+
+# Identify the top 5 locations by total jumps
+top5_locs <- df_loc %>%
+  group_by(Location) %>%
+  summarise(n = n()) %>%
+  arrange(desc(n)) %>%
+  slice(1:5) %>%
+  pull(Location)
+
+results_loc_top5 <- results_loc %>%
+  filter(Group %in% top5_locs)
+
+p <- ggplot(
+  results_loc_top5 %>% filter(Model == "Linear"),
+  aes(x = Group, y = abs_gap_pct, fill = side)
+) +
+  geom_col(position = "dodge") +
+  geom_text(
+    aes(label = paste0(round(abs_gap_pct, 1), "%")),
+    position = position_dodge(width = 0.9),
+    vjust = -0.3,
+    size = 7   # increased for readability
+  ) +
+  scale_fill_manual(
+    name = "Wind Direction",
+    values = ski_palette,
+    labels = c("head" = "Headwind", "tail" = "Tailwind")
+  ) +
+  scale_y_continuous(limits = c(0, 220)) +
+  labs(
+    title    = "Linear",
+    subtitle = NULL,
+    x        = "Venue",
+    y        = "Percent Error"
+  ) +
+  theme_ski() +
+  theme(
+    text = element_text(size = 22),
+    axis.title.x = element_text(size = 26),
+    axis.title.y = element_text(size = 26, angle = 90),
+    axis.text = element_text(size = 22),
+    legend.title = element_text(size = 24),
+    legend.text = element_text(size = 20),
+    strip.text = element_text(size = 24),
+    plot.title = element_text(size = 32),
+    plot.subtitle = element_blank()
+  )
+
+
+#ggsave("female/linear_gap_perc_venue.png", plot = p, width = 16, height = 12,dpi = 600, type = "cairo-png")
+
+
+
+p <- ggplot(
+  results_loc_top5 %>% filter(Model == "RandomForest"),
+  aes(x = Group, y = abs_gap_pct, fill = side)
+) +
+  geom_col(position = "dodge") +
+  geom_text(
+    aes(label = paste0(round(abs_gap_pct, 1), "%")),
+    position = position_dodge(width = 0.9),
+    vjust = -0.3,
+    size = 7   # increased for readability
+  ) +
+  scale_fill_manual(
+    name = "Wind Direction",
+    values = ski_palette,
+    labels = c("head" = "Headwind", "tail" = "Tailwind")
+  ) +
+  scale_y_continuous(limits = c(0, 220)) +
+  labs(
+    title    = "Random Forest",
+    subtitle = NULL,
+    x        = "Venue",
+    y        = "Percent Error"
+  ) +
+  theme_ski() +
+  theme(
+    text = element_text(size = 22),
+    axis.title.x = element_text(size = 26),
+    axis.title.y = element_text(size = 26, angle = 90),
+    axis.text = element_text(size = 22),
+    legend.title = element_text(size = 24),
+    legend.text = element_text(size = 20),
+    strip.text = element_text(size = 24),
+    plot.title = element_text(size = 32),
+    plot.subtitle = element_blank()
+  )
+
+
+#ggsave("female/randfor_gap_perc_venue.png",plot  = p,width = 16,height = 12,type  = "cairo-png",dpi   = 600)
+
+
+
+
+
+```
+
+
+
+
+```{r}
+
+
+# ============================================================
+# Wind Compensation Evaluation — Sorted by |gap_pct|
+# ============================================================
+
+# --- By HillBin ---
+results_bin <- evaluate_wind_compensation_tt(df_clean, level = "HillBin") %>%
+  # Add absolute gap column
+  mutate(abs_gap_pct = abs(gap_pct)) %>%
+  # Sort by smallest absolute percent gap
+  arrange((abs_gap_pct))
+
+# View results
+results_bin
+
+
+# --- By Location (data-rich venues only) ---
+df_loc <- df_clean %>%
+  tidyr::drop_na(Distance_m, Speed_kmh, WindMS, HillSize_m, MeterValue_pts_per_m) %>%
+  dplyr::add_count(Location, name = "n_loc") %>%
+  dplyr::filter(n_loc >= 150)
+
+results_loc <- evaluate_wind_compensation_tt(df_loc, level = "Location") %>%
+  # Add absolute gap column
+  mutate(abs_gap_pct = abs(gap_pct)) %>%
+  # Sort by smallest absolute percent gap
+  arrange((abs_gap_pct))
+
+# View results
+results_loc
+
+## PLOTTING
+
+# Filter linear only
+bin_linear <- results_bin %>%
+  filter(Model == "Linear")
+
+
+bin_rf <- results_bin %>%
+  filter(Model == "RandomForest") %>%
+  group_by(Group, side) %>%
+  summarise(mean_abs_gap_pct = mean(abs_gap_pct, na.rm = TRUE), .groups = "drop")
+
+p <- ggplot(bin_rf, aes(x = Group, y = mean_abs_gap_pct, fill = side)) +
+  geom_col(position = "dodge") +
+  geom_text(
+    aes(label = paste0(round(mean_abs_gap_pct, 1), "%")),
+    position = position_dodge(width = 0.9),
+    vjust = -0.3,
+    size = 7   # increased for readability
+  ) +
+  scale_fill_manual(
+    name = "Wind Direction",
+    values = ski_palette,
+    labels = c("head" = "Headwind", "tail" = "Tailwind")
+  ) +
+  scale_y_continuous(limits = c(0, 220)) +
+  labs(
+    title    = "Random Forest",
+    subtitle = NULL,
+    x        = "Hill size bin",
+    y        = "Percent Error"
+  ) +
+  theme_ski() +
+  theme(
+    text = element_text(size = 22),
+    axis.title.x = element_text(size = 26),
+    axis.title.y = element_text(size = 26, angle = 90),
+    axis.text = element_text(size = 22),
+    legend.title = element_text(size = 24),
+    legend.text = element_text(size = 20),
+    strip.text = element_text(size = 24),
+    plot.title = element_text(size = 32),
+    plot.subtitle = element_blank()
+  )
+
+
+#ggsave("female/randfor_gap_perc_hill.png", plot = p, width = 16, height = 12,dpi = 600, type = "cairo-png")
+
+
+p <- ggplot(bin_linear, aes(x = Group, y = abs_gap_pct, fill = side)) +
+  geom_col(position = "dodge") +
+  geom_text(
+    aes(label = paste0(round(abs_gap_pct, 1), "%")),
+    position = position_dodge(width = 0.9),
+    vjust = -0.3,
+    size = 7   # upgraded from 4 for readability
+  ) +
+  scale_fill_manual(
+    name = "Wind Direction",
+    values = ski_palette,
+    labels = c("head" = "Headwind", "tail" = "Tailwind")
+  ) +
+  scale_y_continuous(limits = c(0, 220)) +
+  labs(
+    title    = "Linear",
+    subtitle = NULL,
+    x        = "Hill size bin",
+    y        = "Percent Error"
+  ) +
+  theme_ski() +
+  theme(
+    text = element_text(size = 22),
+    axis.title.x = element_text(size = 26),
+    axis.title.y = element_text(size = 26, angle = 90),  # vertical y-label
+    axis.text = element_text(size = 22),
+    legend.title = element_text(size = 24),
+    legend.text = element_text(size = 20),
+    strip.text = element_text(size = 24),
+    plot.title = element_text(size = 32),
+    plot.subtitle = element_blank()
+  )
+
+
+#ggsave("female/linear_gap_perc_hill.png", plot = p, width = 16, height = 12,dpi = 600, type = "cairo-png")
+
+
+
+# Identify the top 5 locations by total jumps
+top5_locs <- df_loc %>%
+  group_by(Location) %>%
+  summarise(n = n()) %>%
+  arrange(desc(n)) %>%
+  slice(1:5) %>%
+  pull(Location)
+
+results_loc_top5 <- results_loc %>%
+  filter(Group %in% top5_locs)
+
+p <- ggplot(
+  results_loc_top5 %>% filter(Model == "Linear"),
+  aes(x = Group, y = abs_gap_pct, fill = side)
+) +
+  geom_col(position = "dodge") +
+  geom_text(
+    aes(label = paste0(round(abs_gap_pct, 1), "%")),
+    position = position_dodge(width = 0.9),
+    vjust = -0.3,
+    size = 7    # increased for readability
+  ) +
+  scale_fill_manual(
+    name = "Wind Direction",
+    values = ski_palette,
+    labels = c("head" = "Headwind", "tail" = "Tailwind")
+  ) +
+  scale_y_continuous(limits = c(0, 220)) +
+  labs(
+    title    = "Linear",
+    subtitle = NULL,
+    x        = "Venue",
+    y        = "Percent Error"
+  ) +
+  theme_ski() +
+  theme(
+    text = element_text(size = 22),
+    axis.title.x = element_text(size = 26),
+    axis.title.y = element_text(size = 26, angle = 90),
+    axis.text = element_text(size = 22),
+    legend.title = element_text(size = 24),
+    legend.text = element_text(size = 20),
+    strip.text = element_text(size = 24),
+    plot.title = element_text(size = 32),
+    plot.subtitle = element_blank()
+  )
+
+
+#ggsave("female/linear_gap_perc_venue.png", plot = p, width = 16, height = 12,dpi = 600, type = "cairo-png")
+
+
+
+p <- ggplot(
+  results_loc_top5 %>% filter(Model == "RandomForest"),
+  aes(x = Group, y = abs_gap_pct, fill = side)
+) +
+  geom_col(position = "dodge") +
+  geom_text(
+    aes(label = paste0(round(abs_gap_pct, 1), "%")),
+    position = position_dodge(width = 0.9),
+    vjust = -0.3,
+    size = 7    # increased from 4 for readability
+  ) +
+  scale_fill_manual(
+    name = "Wind Direction",
+    values = ski_palette,
+    labels = c("head" = "Headwind", "tail" = "Tailwind")
+  ) +
+  scale_y_continuous(limits = c(0, 220)) +
+  labs(
+    title    = "Random Forest",
+    subtitle = NULL,
+    x        = "Venue",
+    y        = "Percent Error"
+  ) +
+  theme_ski() +
+  theme(
+    text = element_text(size = 22),
+    axis.title.x = element_text(size = 26),
+    axis.title.y = element_text(size = 26, angle = 90),  # vertical orientation
+    axis.text = element_text(size = 22),
+    legend.title = element_text(size = 24),
+    legend.text = element_text(size = 20),
+    strip.text = element_text(size = 24),
+    plot.title = element_text(size = 32),
+    plot.subtitle = element_blank()
+  )
+
+
+#ggsave("female/randfor_gap_perc_venue.png",plot  = p,width = 16,height = 12,type  = "cairo-png",dpi   = 600)
+
+
+```
+
+
+
+
+```{r}
+## ---- Prepare data (make one row per venue–side–model, with ordering) ----
+
+# Make sure results_loc_top10 already exists as your filtered-by-top-10-side table.
+# If not, you can recreate it like this (safe to re-run):
+
+## ---- Build Top-10 Venue–Side Table (Exactly 10 Rows) ----
+
+library(forcats)
+
+# Top 10 venue–side combos for the Linear model
+lin_data <- results_loc %>%
+  filter(Model == "Linear") %>%
+  mutate(
+    n_side    = n_train_side + n_test_side,
+    GroupSide = fct_reorder(paste(Group, side, sep = "___"), n_side, .desc = TRUE),
+    GroupSide = fct_rev(GroupSide)  # forces largest to appear at the top after coord_flip
+  ) %>%
+  arrange(desc(n_side)) %>%
+  slice_head(n = 10)
+
+
+# Top 10 venue–side combos for the Random Forest model
+rf_data <- results_loc %>%
+  filter(Model == "RandomForest") %>%
+  mutate(
+    n_side    = n_train_side + n_test_side,
+    GroupSide = fct_reorder(paste(Group, side, sep = "___"), n_side, .desc = TRUE),
+    GroupSide = fct_rev(GroupSide)  # same fix
+  ) %>%
+  arrange(desc(n_side)) %>%
+  slice_head(n = 10)
+
+
+
+## ---- Linear ----
+p <- ggplot(
+  lin_data,
+  aes(x = GroupSide, y = abs_gap_pct, fill = side)
+) +
+  geom_col() +
+  geom_text(
+    aes(label = paste0(round(abs_gap_pct, 1), "%")),
+    hjust = -0.2,
+    size  = 7   # was 3; much easier to read
+  ) +
+  scale_x_discrete(
+    labels = function(x) sub("___.*$", "", x)   # show only venue name on axis
+  ) +
+  scale_fill_manual(
+    name   = "Wind direction",
+    values = ski_palette[c("head", "tail")],
+    labels = c(head = "Headwind", tail = "Tailwind")
+  ) +
+  scale_y_continuous(
+    limits = c(0, 125),
+    expand = expansion(mult = c(0, 0.15))
+  ) +
+  coord_flip(clip = "off") +
+  labs(
+    title    = "Linear - Female",
+    subtitle = NULL,
+    x        = "Venue",
+    y        = "Percent error"
+  ) +
+  theme_minimal() +
+  theme(
+  text = element_text(size = 30),
+
+  axis.title.x = element_text(size = 36),
+  axis.title.y = element_text(size = 36, angle = 90),
+
+  axis.text.x = element_text(size = 30),
+  axis.text.y = element_text(size = 30),
+
+  legend.title = element_text(size = 32),
+  legend.text  = element_text(size = 28),
+
+  plot.title = element_text(size = 44),
+  plot.subtitle = element_text(size = 34),
+
+  strip.text = element_text(size = 32),   # if faceting
+
+  panel.grid       = element_blank(),
+  panel.border     = element_blank(),
+  panel.background = element_blank()
+)
+
+
+p
+
+#ggsave( "female/linear_gap_perc_venue_top10_side.png",plot   = p,width  = 12,height = 8,dpi    = 600,type   = "cairo-png")
+
+
+## ---- Random Forest ----
+p <- ggplot(
+  rf_data,
+  aes(x = GroupSide, y = abs_gap_pct, fill = side)
+) +
+  geom_col() +
+  geom_text(
+    aes(label = paste0(round(abs_gap_pct, 1), "%")),
+    hjust = -0.2,
+    size  = 7    # increased from 3 to match other figures
+  ) +
+  scale_x_discrete(
+    labels = function(x) sub("___.*$", "", x)
+  ) +
+  scale_fill_manual(
+    name   = "Wind direction",
+    values = ski_palette[c("head", "tail")],
+    labels = c(head = "Headwind", tail = "Tailwind")
+  ) +
+  scale_y_continuous(
+    limits = c(0, 125),
+    expand = expansion(mult = c(0, 0.15))
+  ) +
+  coord_flip(clip = "off") +
+  labs(
+    title    = "Random Forest - Female",
+    subtitle = NULL,
+    x        = "Venue",
+    y        = "Percent error"
+  ) +
+  theme_minimal() +
+  theme(
+  text = element_text(size = 30),
+
+  axis.title.x = element_text(size = 36),
+  axis.title.y = element_text(size = 36, angle = 90),
+
+  axis.text.x = element_text(size = 30),
+  axis.text.y = element_text(size = 30),
+
+  legend.title = element_text(size = 32),
+  legend.text  = element_text(size = 28),
+
+  plot.title = element_text(size = 44),
+  plot.subtitle = element_text(size = 34),
+
+  strip.text = element_text(size = 32),   # if faceting
+
+  panel.grid       = element_blank(),
+  panel.border     = element_blank(),
+  panel.background = element_blank()
+)
+
+p
+
+#ggsave("female/randfor_gap_perc_venue_top10_side.png",plot   = p,width  = 12,height = 8,dpi    = 600,type   = "cairo-png")
+
+
+  
+```
+
+
+```{r}
+
+# ---- 8) plotting helper (quick comparison) ----
+# Scatter of model-based vs official factors (points/ms) with 45° line.
+plot_compensation_compare <- function(results_tbl, title = "Model vs Official Wind Factors (points per m/s)") {
+  req <- c("Group","side","model_pts_per_ms","official_pts_per_ms")
+  stopifnot(all(req %in% names(results_tbl)))
+
+  ggplot(results_tbl, aes(x = official_pts_per_ms, y = model_pts_per_ms, label = Group)) +
+    geom_abline(slope = 1, intercept = 0, linetype = 2) +
+    geom_point(alpha = 0.75) +
+    ggplot2::facet_wrap(~ side) +
+    ggplot2::labs(
+      x = "Official factor (points per m/s)",
+      y = "Model-based factor (points per m/s)",
+      title = title
+    ) +
+    ggplot2::theme_minimal(base_size = 12)
+}
+
+# Examples:
+plot_compensation_compare(results_bin, "Bins: Model vs Official")
+plot_compensation_compare(results_loc, "Venues: Model vs Official")
+
+
+```
+
+
+```{r}
+
+# ---- 8) plotting helper (quick comparison) ----
+# Scatter of model-based vs official factors (points/ms) with 45° line.
+plot_compensation_compare <- function(results_tbl, title = "Model vs Official Wind Factors (points per m/s)") {
+  req <- c("Group","side","model_pts_per_ms","official_pts_per_ms")
+  stopifnot(all(req %in% names(results_tbl)))
+
+  ggplot(results_tbl, aes(x = official_pts_per_ms, y = model_pts_per_ms, label = Group)) +
+    geom_abline(slope = 1, intercept = 0, linetype = 2) +
+    geom_point(alpha = 0.75) +
+    ggplot2::facet_wrap(~ side) +
+    ggplot2::labs(
+      x = "Official factor (points per m/s)",
+      y = "Model-based factor (points per m/s)",
+      title = title
+    ) + scale_fill_ski()
+}
+
+# Examples:
+plot_compensation_compare(results_bin, "Bins: Model vs Official")
+plot_compensation_compare(results_loc, "Venues: Model vs Official")
+
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
