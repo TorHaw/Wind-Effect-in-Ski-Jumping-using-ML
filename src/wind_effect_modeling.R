@@ -2,7 +2,7 @@
 # Title: Evaluation of Wind Effects in Ski Jumping using Machine Learning
 # Authors: MIDN Toren Hawk, MIDN Travis Hockin, Dr. Gavin Taylor
 # Description:
-#   Publication-ready, dataset-agnostic analysis pipeline to:
+#   Dataset-agnostic analysis pipeline to:
 #     (1) Compare 4 model families (Linear, Polynomial, GAM, Random Forest)
 #         with and without wind across hill bins.
 #     (2) Produce publication-quality figures (distribution, PVA, wind curves).
