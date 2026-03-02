@@ -9,7 +9,9 @@ authors:
     given-names: Travis
   - family-names: Taylor
     given-names: Gavin
-repository-code: "https://github.com/<YOUR_ORG_OR_USER>/<YOUR_REPO>"
+  - family-names: Elfmark
+    given-names: Ola
+repository-code: "https://github.com/TorHaw/Modeling-Wind-Effect-in-Ski-Jumping-using-ML"
 license: MIT
 keywords:
   - ski jumping
